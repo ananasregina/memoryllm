@@ -1,6 +1,6 @@
-# memoryllm
+# memoryllm v0.2
 
-A transparent proxy to OpenAI-compatible LLMs that injects user memories via Cognee.
+A transparent proxy to OpenAI-compatible LLMs that injects user memories via the Cognee MCP server.
 
 ## Features
 
@@ -11,13 +11,15 @@ A transparent proxy to OpenAI-compatible LLMs that injects user memories via Cog
 - **Intelligent Search**: Optimizes Cognee queries by focusing on the latest user interaction
 - **Zero Validation**: Passes through all requests unchanged if parsing fails
 - **OpenRouter Ready**: Authenticates and routes to OpenRouter by default
+- **MCP Integration**: Connects directly to Cognee MCP server for low-latency memory retrieval
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.12 (Cognee requirement)
+- Python 3.12+
 - [uv](https://github.com/astral-sh/uv) for virtual environment management
+- A running [Cognee MCP Server](https://docs.cognee.ai/cognee-mcp/mcp-quickstart) (default: `http://127.0.0.1:9998/sse`)
 
 ### Installation
 
@@ -45,9 +47,9 @@ Create a `.env` file with the following variables:
 # IMPORTANT: Only include the base URL, NOT the full path
 LLM_PROVIDER_URL="https://openrouter.ai/api/v1"
 
-# Cognee CLI Configuration
-# Path to your Cognee CLI installation directory
-COGNEE_CLI_PATH="/Users/talimoreno/cognee"
+# Cognee MCP Configuration
+# URL of your running Cognee MCP server (SSE endpoint)
+COGNEE_MCP_URL="http://127.0.0.1:9998/sse"
 ```
 
 ### Running the Proxy
@@ -83,53 +85,24 @@ response = client.chat.completions.create(
 
 ```
 Client → memoryllm Proxy → LLM Provider
-                     ↓
-               Cognee Memory Search
+                     ↕
+               Cognee MCP Server
 ```
 
 1. Client sends request to memoryllm proxy
 2. Proxy extracts query text from user messages
-3. Proxy searches Cognee for relevant memories
+3. Proxy calls `search` tool on Cognee MCP server
 4. If memories found, injects them as system message
 5. Proxy forwards modified request to actual LLM provider
 6. LLM response returned to client
-
-## Memory Injection
-
-Memories are injected as system messages at the beginning of the messages array:
-
-```json
-{
-  "messages": [
-    {
-      "role": "system",
-      "content": "Relevant memories:\n\nMemory 1 content...\n\nMemory 2 content..."
-    },
-    {
-      "role": "user",
-      "content": "Original user message..."
-    }
-  ]
-}
-```
-
-## Error Handling
-
-The proxy is designed to be resilient:
-
-- **Cognee failures**: If memory search fails, request continues without memories
-- **Request parsing failures**: If request can't be parsed, original request is passed through
-- **LLM provider failures**: Proper error responses are returned to client
-
-All failures are logged with detailed information for debugging.
 
 ## Development
 
 ### Running Tests
 
 ```bash
-source .venv/bin/activate
-python test_proxy.py
+# Integration test for MCP connection
+uv run python test_mcp_integration.py
 ```
 
 ### Project Structure
@@ -137,7 +110,7 @@ python test_proxy.py
 ```
 memoryllm/
 ├── main.py                # Main proxy server
-├── test_proxy.py          # Test scripts
+├── test_mcp_integration.py # MCP integration tests
 ├── .env.example           # Example environment file
 ├── pyproject.toml         # Python project configuration
 ├── README.md              # This file
@@ -146,20 +119,12 @@ memoryllm/
 
 ## Future Enhancements
 
-- [ ] Real Cognee integration for memory search
 - [ ] Configuration for Cognee database and dataset
 - [ ] Caching mechanism for Cognee search results
 - [x] Streaming support for chat completions
 - [x] Additional OpenAI endpoint support
+- [x] Cognee MCP Integration
 
 ## License
 
 MIT
-
-## Contributing
-
-Pull requests welcome! Please follow the existing code style and add tests for new features.
-
----
-
-**Note**: This is v0.1 - a minimal working version. Cognee integration is planned for the next phase.

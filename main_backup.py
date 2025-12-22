@@ -2,18 +2,13 @@
 
 import os
 import logging
+import subprocess
 import json
-import asyncio
-from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List
-
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 import httpx
 from dotenv import load_dotenv
-
-from mcp import ClientSession
-from mcp.client.sse import sse_client
 
 # Initialize logging
 logging.basicConfig(
@@ -26,110 +21,81 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Configuration constants
-# Default to Cognee MCP server running locally
-COGNEE_MCP_URL = os.getenv("COGNEE_MCP_URL", "http://127.0.0.1:9998/sse")
-# We still support LLM_PROVIDER_URL
+COGNEE_CLI_PATH = os.getenv("COGNEE_CLI_PATH", "/Users/talimoreno/cognee")
 LLM_PROVIDER_URL = os.getenv("LLM_PROVIDER_URL")
 
-# Global reference to MCP session
-mcp_session: Optional[ClientSession] = None
-mcp_cleanup: Optional[callable] = None
-
 # Validate required configuration
+# Strict check removed, will default to OpenRouter
 if not LLM_PROVIDER_URL:
     logger.warning("LLM_PROVIDER_URL not set, defaulting to OpenRouter (https://openrouter.ai/api/v1)")
 
-logger.info(f"Configuration loaded: Cognee MCP={COGNEE_MCP_URL}, LLM={LLM_PROVIDER_URL}")
+logger.info(f"Configuration loaded: Cognee CLI={COGNEE_CLI_PATH}, LLM={LLM_PROVIDER_URL}")
 
+# Create FastAPI app
+app = FastAPI()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def search_memories_cli(query_text: str) -> Optional[str]:
     """
-    Manage the lifecycle of the MCP client session.
+    Search memories using Cognee CLI with resilience.
+    Returns None if search fails, allowing the proxy to continue without memories.
     """
-    global mcp_session, mcp_cleanup
-    logger.info(f"Connecting to Cognee MCP server at {COGNEE_MCP_URL}...")
-    
     try:
-        # We need to manually manage the async generator for sse_client
-        # because we want to keep the session open for the lifetime of the app
-        sse_cm = sse_client(COGNEE_MCP_URL)
-        read_stream, write_stream = await sse_cm.__aenter__()
+        logger.info(f"Searching memories using Cognee CLI for query: {query_text}")
         
-        session_cm = ClientSession(read_stream, write_stream)
-        mcp_session = await session_cm.__aenter__()
+        # Run Cognee CLI command with JSON output format
+        result = subprocess.run([
+            "uv", "--directory", COGNEE_CLI_PATH, "run",
+            "cognee-cli", "search", query_text, "--output-format", "json"
+        ], capture_output=True, text=True, check=True)
         
-        await mcp_session.initialize()
-        logger.info("Connected and initialized Cognee MCP session")
-        
-        yield
-        
-        # Cleanup
-        logger.info("Closing Cognee MCP session...")
-        await session_cm.__aexit__(None, None, None)
-        await sse_cm.__aexit__(None, None, None)
-        
-    except Exception as e:
-        logger.error(f"Failed to connect to Cognee MCP server: {e}")
-        logger.warning("Application starting without Cognee integration")
-        yield
-
-
-# Create FastAPI app with lifespan
-app = FastAPI(lifespan=lifespan)
-
-async def search_memories_mcp(query_text: str) -> Optional[str]:
-    """
-    Search memories using Cognee MCP server.
-    """
-    global mcp_session
-    
-    if not mcp_session:
-        logger.warning("MCP session not available, skipping memory search")
-        return None
-        
-    try:
-        logger.info(f"Searching memories using Cognee MCP for query: {query_text}")
-        
-        # Call the 'search' tool on the MCP server
-        # arguments={"query": query_text} based on Cognee MCP docs/expectations
-        # In the tools list provided earlier: "search: Retrieve relevant memories using semantic search"
-        # We assume the argument name is 'query' or similar.
-        # Based on standard practices, we'll try 'query'. If it fails, we might need to adjust.
-        # Although the CLI command was just `cognee-cli search query -...`
-        
-        # Let's inspect available tools first if we are unsure, but for now we assume 'search' exists
-        result = await mcp_session.call_tool("search", arguments={"search_query": query_text, "search_type": "CHUNKS"})
-        
-        # result is a CallToolResult
-        # It has a content list (TextContent or ImageContent)
-        if not result.content:
-            logger.info("No content returned from Cognee search")
+        # Parse clean JSON output from Cognee CLI
+        try:
+            # With --output-format json, we get JSON array but may have some logging text
+            # Find the start of the JSON array
+            json_start = result.stdout.find('[')
+            if json_start == -1:
+                logger.error("No JSON array found in Cognee CLI output")
+                logger.debug(f"Full output: {result.stdout[:500]}...")
+                return None
+            
+            json_str = result.stdout[json_start:]
+            data = json.loads(json_str)
+            
+            # Cognee returns an array, get first result
+            if data and len(data) > 0 and 'search_result' in data[0] and data[0]['search_result']:
+                # Extract the actual memory content
+                memory_content = data[0]['search_result'][0]
+                logger.info(f"Found memory for query: {query_text}")
+                logger.debug(f"Memory content: {str(memory_content)[:200]}...")
+                return str(memory_content)
+            else:
+                logger.info("No memories found in Cognee response")
+                return None
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Cognee CLI JSON output: {str(e)}")
+            logger.debug(f"Raw output: {result.stdout[:500]}...")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error parsing Cognee CLI output: {str(e)}")
             return None
             
-        # Concatenate all text content
-        memory_content = ""
-        for item in result.content:
-            if hasattr(item, 'text'):
-                memory_content += item.text + "\n"
-        
-        if memory_content.strip():
-            logger.info(f"Found memory for query: {query_text}")
-            logger.debug(f"Memory content: {memory_content[:200]}...")
-            return memory_content.strip()
-        else:
-            logger.info("No text content in Cognee response")
-            return None
-
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Cognee CLI search failed: {str(e)}")
+        logger.debug(f"Stderr: {e.stderr}")
+        logger.info("Continuing without memory injection due to Cognee CLI failure")
+        return None
     except Exception as e:
-        logger.error(f"Error calling Cognee MCP tool: {str(e)}")
+        logger.error(f"Unexpected error in Cognee search: {str(e)}")
+        logger.info("Continuing without memory injection")
         return None
 
 async def search_memories(query_text: str) -> Optional[str]:
     """
-    Wrapper for memory search.
+    Async wrapper for memory search that can be used with either CLI or future API integration.
     """
-    return await search_memories_mcp(query_text)
+    # Use CLI implementation
+    return search_memories_cli(query_text)
 
 def inject_memories_into_request(request_data: Dict[str, Any], memories: str) -> Dict[str, Any]:
     """
@@ -179,13 +145,6 @@ async def proxy_request_to_llm(request_data: Dict[str, Any], llm_url: str, heade
     except Exception as e:
         logger.error(f"Failed to proxy request to LLM: {str(e)}")
         raise HTTPException(status_code=502, detail="Failed to connect to LLM provider")
-
-def get_llm_base_url():
-    if not LLM_PROVIDER_URL:
-        # Fallback hardcoded as requested
-        return "https://openrouter.ai/api/v1"
-    else:
-        return str(LLM_PROVIDER_URL).rstrip('/')
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -272,6 +231,12 @@ async def chat_completions(request: Request):
         logger.error(f"Unexpected error processing request: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+def get_llm_base_url():
+    if not LLM_PROVIDER_URL:
+        # Fallback hardcoded as requested
+        return "https://openrouter.ai/api/v1"
+    else:
+        return str(LLM_PROVIDER_URL).rstrip('/')
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def proxy_generic(request: Request, path: str):
@@ -308,7 +273,53 @@ async def proxy_generic(request: Request, path: str):
         # Read body if it exists
         body = await request.body()
         
-        # Prepare client request for generic proxy
+        # Prepare client request
+        # We need to define a generator to ensure the client stays open while streaming
+        async def stream_generator():
+            try:
+                # Use a new client for the stream
+                async with httpx.AsyncClient() as client:
+                    req = client.build_request(
+                        request.method,
+                        target_url,
+                        headers=proxy_headers,
+                        content=body,
+                        timeout=60.0
+                    )
+                    
+                    # Send request with stream=True
+                    r = await client.send(req, stream=True)
+                    
+                    # We can't return headers from here to the StreamingResponse constructor 
+                    # because it requires them immediately.
+                    # But we only get them after sending the request. 
+                    # This is a limitation of simple proxying with FastAPI StreamingResponse.
+                    # However, we can hack it or just accept that we need to fetch headers first?
+                    # No, StreamingResponse takes a generator.
+                    # If we want to set headers dynamically based on upstream, we might have a problem 
+                    # if we wrap everything in the generator.
+                    
+                    # WAIT. The StreamingResponse headers are sent *before* the body.
+                    # If we use a generator, the body starts yielding later.
+                    # BUT `StreamingResponse` expects headers at construction time (or set on response object).
+                    
+                    # If we are inside the generator, headers are already sent by FastAPI!
+                    
+                    # Solution: We cannot easily forward upstream headers dynamically if we use `StreamingResponse` 
+                    # AND need to keep the client open in a generator *unless* we construct the response *inside* 
+                    # the generator (which we can't do, we return the response).
+                    
+                    # ALTERNATIVE: Don't use `async with client` context manager for the *return*?
+                    # Or manually close client?
+                    # `httpx.AsyncClient()` can be used without context manager, but needs `.aclose()`.
+                    
+                    # Let's try manual lifecycle management for the generic proxy
+                    pass
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
+
+        # BETTER APPROACH matching typical FastAPI proxy patterns:
+        
         client = httpx.AsyncClient()
         req = client.build_request(
             request.method,
