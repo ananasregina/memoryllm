@@ -4,11 +4,13 @@ A transparent proxy to OpenAI-compatible LLMs that injects user memories via Cog
 
 ## Features
 
-- **Transparent Proxy**: Drop-in replacement for OpenAI endpoints - just change the URL
-- **Memory Injection**: Automatically adds relevant memories as system messages
-- **Resilient Design**: Never fails requests due to memory system issues
+- **Transparent Proxy**: Drop-in replacement for OpenAI endpoints
+- **Universal Compatibility**: Proxies all endpoints (`/v1/models`, `/v1/embeddings`, etc.) transparently
+- **Memory Injection**: Automatically adds relevant memories as system messages to chat completions
+- **Streaming Support**: Full support for `stream=True` responses
+- **Intelligent Search**: Optimizes Cognee queries by focusing on the latest user interaction
 - **Zero Validation**: Passes through all requests unchanged if parsing fails
-- **Focused Logging**: Clear visibility into memory operations
+- **OpenRouter Ready**: Authenticates and routes to OpenRouter by default
 
 ## Quick Start
 
@@ -38,21 +40,14 @@ cp .env.example .env
 Create a `.env` file with the following variables:
 
 ```env
-# LLM Provider BASE URL (e.g., OpenRouter, Azure, etc.)
+# LLM Provider BASE URL
+# Defaults to https://openrouter.ai/api/v1 if not set
 # IMPORTANT: Only include the base URL, NOT the full path
-# Examples:
-#   OpenRouter: https://api.openrouter.ai
-#   Azure: https://your-resource.openai.azure.com
-#   Local: http://localhost:8000
-LLM_PROVIDER_URL="https://api.openrouter.ai"
+LLM_PROVIDER_URL="https://openrouter.ai/api/v1"
 
 # Cognee CLI Configuration
 # Path to your Cognee CLI installation directory
 COGNEE_CLI_PATH="/Users/talimoreno/cognee"
-
-# Optional: Cognee environment variables
-# These will be passed to the Cognee CLI process
-# ENABLE_BACKEND_ACCESS_CONTROL=false
 ```
 
 ### Running the Proxy
@@ -154,8 +149,8 @@ memoryllm/
 - [ ] Real Cognee integration for memory search
 - [ ] Configuration for Cognee database and dataset
 - [ ] Caching mechanism for Cognee search results
-- [ ] Streaming support for chat completions
-- [ ] Additional OpenAI endpoint support
+- [x] Streaming support for chat completions
+- [x] Additional OpenAI endpoint support
 
 ## License
 
