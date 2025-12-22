@@ -98,8 +98,9 @@ async def search_memories_mcp(query_text: str) -> Optional[str]:
         # Based on standard practices, we'll try 'query'. If it fails, we might need to adjust.
         # Although the CLI command was just `cognee-cli search query -...`
         
-        # Let's inspect available tools first if we are unsure, but for now we assume 'search' exists
-        result = await mcp_session.call_tool("search", arguments={"search_query": query_text, "search_type": "CHUNKS"})
+        # Call the 'search' tool on the MCP server
+        # We use GRAPH_COMPLETION for better context, as requested
+        result = await mcp_session.call_tool("search", arguments={"search_query": query_text, "search_type": "GRAPH_COMPLETION"})
         
         # result is a CallToolResult
         # It has a content list (TextContent or ImageContent)
@@ -114,9 +115,18 @@ async def search_memories_mcp(query_text: str) -> Optional[str]:
                 memory_content += item.text + "\n"
         
         if memory_content.strip():
+            # Implement "modesty" - limit the amount of context we inject
+            # 4000 chars is roughly 1000 tokens, which is a reasonable safety margin
+            MAX_MEMORY_LENGTH = 4000
+            
+            final_memory = memory_content.strip()
+            if len(final_memory) > MAX_MEMORY_LENGTH:
+                logger.info(f"Memory content too long ({len(final_memory)} chars), truncating to {MAX_MEMORY_LENGTH}")
+                final_memory = final_memory[:MAX_MEMORY_LENGTH] + "\n...(memories truncated for brevity)..."
+                
             logger.info(f"Found memory for query: {query_text}")
-            logger.debug(f"Memory content: {memory_content[:200]}...")
-            return memory_content.strip()
+            logger.debug(f"Memory content: {final_memory[:200]}...")
+            return final_memory
         else:
             logger.info("No text content in Cognee response")
             return None

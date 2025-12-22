@@ -43,7 +43,7 @@ async def test_mcp_connection():
                 logger.info(f"Testing search with query: '{query}'")
                 
                 try:
-                    result = await session.call_tool("search", arguments={"search_query": query, "search_type": "CHUNKS"})
+                    result = await session.call_tool("search", arguments={"search_query": query, "search_type": "GRAPH_COMPLETION"})
                     
                     if result.content:
                         logger.info("✓ Search returned content")
