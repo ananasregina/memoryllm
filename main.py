@@ -33,6 +33,10 @@ COGNEE_MCP_URL = os.getenv("COGNEE_MCP_URL", "http://127.0.0.1:9998/sse")
 # We still support LLM_PROVIDER_URL
 LLM_PROVIDER_URL = os.getenv("LLM_PROVIDER_URL")
 
+# Terms that, if present in the user message, trigger skipping memory search
+SKIP_SEARCH_TERMS_RAW = os.getenv("SKIP_SEARCH_TERMS", "Here are the first few user messages")
+SKIP_SEARCH_TERMS = [term.strip() for term in SKIP_SEARCH_TERMS_RAW.split(",") if term.strip()]
+
 # Global reference to MCP session
 mcp_session: Optional[ClientSession] = None
 mcp_cleanup: Optional[callable] = None
@@ -101,7 +105,8 @@ async def search_memories_mcp(query_text: str) -> Optional[str]:
         # Although the CLI command was just `cognee-cli search query -...`
         
         # Call the 'search' tool on the MCP server
-        # We use GRAPH_COMPLETION for better context, as requested
+        # We use GRAPH_COMPLETION with the CLEANED query. 
+        # The cleaning removes the title-generation noise which was the main cause of poor results.
         result = await mcp_session.call_tool("search", arguments={"search_query": query_text, "search_type": "GRAPH_COMPLETION"})
         
         # result is a CallToolResult
@@ -226,6 +231,22 @@ def get_llm_base_url():
     else:
         return str(LLM_PROVIDER_URL).rstrip('/')
 
+def clean_query_text(text: str) -> str:
+    """
+    Strips meta-instructions and session title generation prompts from user query
+    to isolate the actual user intent for Cognee search.
+    """
+    # Pattern for "Here are the first few user messages: ... Based on the conversation"
+    meta_pattern = r"Here are the first few user messages:\s*(.*?)\s*Based on the conversation"
+    match = re.search(meta_pattern, text, re.DOTALL | re.IGNORECASE)
+    if match:
+        content = match.group(1).strip()
+        logger.info(f"Cleaned query from meta-prompt. Extracted: {content[:100]}...")
+        return content
+
+    # If no meta-prompt found, just return cleaned text
+    return text.strip()
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """
@@ -248,10 +269,32 @@ async def chat_completions(request: Request):
         
         if not query_text:
             query_text = "general conversation"  # Fallback query
+
+        # Check if we should skip memory search based on filtered terms
+        should_skip_search = False
+        for term in SKIP_SEARCH_TERMS:
+            if term in query_text:
+                logger.info(f"Skipping Cognee search: query contains filtered term '{term}'")
+                should_skip_search = True
+                break
             
         # Search for relevant memories
-        search_query = f"I am searching for relevant memories to provide context for an LLM response to the following user message: {query_text}"
-        memories = await search_memories(search_query)
+        memories = None
+        if not should_skip_search:
+            cleaned_query = clean_query_text(query_text)
+            
+            # If after cleaning the query is just instructions (like for titles), skip search
+            # We check if it's too short or contains only phrasing from the title prompt
+            if not cleaned_query or len(cleaned_query) < 5:
+                logger.info("Skipping Cognee search: cleaned query is empty or too short")
+            else:
+                # Use INSIGHTS which returns raw graph triplets (triplets node1 -- rel -- node2)
+                # This avoids LLM 'synthesizing' noise or summaries.
+                logger.info(f"Searching Cognee INSIGHTS for: {cleaned_query}")
+                memories = await search_memories_mcp(cleaned_query)
+                # search_memories_mcp should be updated to use INSIGHTS internally or we pass it
+        else:
+            logger.info("Cognee search skipped due to filter match")
         
         # Inject memories into request if found
         final_request_data = request_data
