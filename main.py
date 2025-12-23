@@ -11,6 +11,8 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 import httpx
 from dotenv import load_dotenv
+import ast
+import re
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -109,10 +111,37 @@ async def search_memories_mcp(query_text: str) -> Optional[str]:
             return None
             
         # Concatenate all text content
+        # The result from Cognee MCP (GRAPH_COMPLETION) often comes as a string representation of a dict
+        # e.g., "{'search_result': ['The context...'], 'dataset_id': UUID(...)}"
         memory_content = ""
+        
         for item in result.content:
             if hasattr(item, 'text'):
-                memory_content += item.text + "\n"
+                raw_text = item.text
+                
+                # Try to parse if it looks like a dict string
+                if "search_result" in raw_text:
+                    try:
+                        # Handle UUIDs which cause json.loads/ast.literal_eval to fail if not handled
+                        # Simple hack: replace UUID('...') with just the string '...'
+                        clean_text = re.sub(r"UUID\('([^']+)'\)", r"'\1'", raw_text)
+                        parsed = ast.literal_eval(clean_text)
+                        
+                        if isinstance(parsed, dict) and "search_result" in parsed:
+                            results = parsed["search_result"]
+                            if isinstance(results, list):
+                                memory_content += "\n".join(results) + "\n"
+                            else:
+                                memory_content += str(results) + "\n"
+                        else:
+                            # Fallback if parsing structure isn't exactly as expected
+                            memory_content += raw_text + "\n"
+                    except Exception as e:
+                        logger.warning(f"Failed to parse structured memory response: {e}")
+                        # If parsing fails, use the raw text but maybe try to clean it
+                        memory_content += raw_text + "\n"
+                else:
+                    memory_content += raw_text + "\n"
         
         if memory_content.strip():
             # Implement "modesty" - limit the amount of context we inject
@@ -125,7 +154,7 @@ async def search_memories_mcp(query_text: str) -> Optional[str]:
                 final_memory = final_memory[:MAX_MEMORY_LENGTH] + "\n...(memories truncated for brevity)..."
                 
             logger.info(f"Found memory for query: {query_text}")
-            logger.debug(f"Memory content: {final_memory[:200]}...")
+            logger.info(f"Memory content: {final_memory}")
             return final_memory
         else:
             logger.info("No text content in Cognee response")
@@ -221,7 +250,8 @@ async def chat_completions(request: Request):
             query_text = "general conversation"  # Fallback query
             
         # Search for relevant memories
-        memories = await search_memories(query_text)
+        search_query = f"I am searching for relevant memories to provide context for an LLM response to the following user message: {query_text}"
+        memories = await search_memories(search_query)
         
         # Inject memories into request if found
         final_request_data = request_data
