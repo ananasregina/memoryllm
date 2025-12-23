@@ -37,6 +37,40 @@ LLM_PROVIDER_URL = os.getenv("LLM_PROVIDER_URL")
 SKIP_SEARCH_TERMS_RAW = os.getenv("SKIP_SEARCH_TERMS", "Here are the first few user messages")
 SKIP_SEARCH_TERMS = [term.strip() for term in SKIP_SEARCH_TERMS_RAW.split(",") if term.strip()]
 
+# Rate limiting configuration
+MAX_MPS = float(os.getenv("MAX_MESSAGES_PER_SECOND", "1"))
+logger.info(f"Rate limit set to {MAX_MPS} messages per second")
+
+class Throttler:
+    """
+    Ensures a minimum time gap between requests to avoid hammering the provider.
+    """
+    def __init__(self, mps: float):
+        self.mps = mps
+        self.min_interval = 1.0 / mps if mps > 0 else 0
+        self.last_request_time = 0
+        self._lock = asyncio.Lock()
+
+    async def wait(self):
+        if self.mps <= 0:
+            return
+            
+        async with self._lock:
+            current_time = asyncio.get_event_loop().time()
+            elapsed = current_time - self.last_request_time
+            
+            if elapsed < self.min_interval:
+                wait_time = self.min_interval - elapsed
+                logger.info(f"Throttling: waiting {wait_time:.3f}s before sending request")
+                await asyncio.sleep(wait_time)
+                # Update current time after sleep
+                current_time = asyncio.get_event_loop().time()
+            
+            self.last_request_time = current_time
+
+# Global throttler instance
+throttler = Throttler(MAX_MPS)
+
 # Global reference to MCP session
 mcp_session: Optional[ClientSession] = None
 mcp_cleanup: Optional[callable] = None
@@ -105,9 +139,8 @@ async def search_memories_mcp(query_text: str) -> Optional[str]:
         # Although the CLI command was just `cognee-cli search query -...`
         
         # Call the 'search' tool on the MCP server
-        # We use GRAPH_COMPLETION with the CLEANED query. 
-        # The cleaning removes the title-generation noise which was the main cause of poor results.
-        result = await mcp_session.call_tool("search", arguments={"search_query": query_text, "search_type": "GRAPH_COMPLETION"})
+        # We use CHUNKS to get raw text segments which are less prone to synthesis hullucinations
+        result = await mcp_session.call_tool("search", arguments={"search_query": query_text, "search_type": "CHUNKS"})
         
         # result is a CallToolResult
         # It has a content list (TextContent or ImageContent)
@@ -124,26 +157,42 @@ async def search_memories_mcp(query_text: str) -> Optional[str]:
             if hasattr(item, 'text'):
                 raw_text = item.text
                 
-                # Try to parse if it looks like a dict string
-                if "search_result" in raw_text:
+                # Check if it looks like structured data (JSON/Python literal)
+                if "[" in raw_text or "{" in raw_text:
                     try:
-                        # Handle UUIDs which cause json.loads/ast.literal_eval to fail if not handled
-                        # Simple hack: replace UUID('...') with just the string '...'
+                        # Handle UUIDs
                         clean_text = re.sub(r"UUID\('([^']+)'\)", r"'\1'", raw_text)
                         parsed = ast.literal_eval(clean_text)
                         
-                        if isinstance(parsed, dict) and "search_result" in parsed:
-                            results = parsed["search_result"]
-                            if isinstance(results, list):
-                                memory_content += "\n".join(results) + "\n"
-                            else:
-                                memory_content += str(results) + "\n"
+                        def extract_text_recursive(obj):
+                            """Recursively forage for 'text' or 'search_result' data."""
+                            found_text = ""
+                            if isinstance(obj, list):
+                                for i in obj:
+                                    found_text += extract_text_recursive(i)
+                            elif isinstance(obj, dict):
+                                if "text" in obj and isinstance(obj["text"], str):
+                                    found_text += obj["text"] + "\n"
+                                elif "search_result" in obj:
+                                    found_text += extract_text_recursive(obj["search_result"])
+                                else:
+                                    for v in obj.values():
+                                        if isinstance(v, (list, dict)):
+                                            found_text += extract_text_recursive(v)
+                            return found_text
+
+                        extracted = extract_text_recursive(parsed)
+                        if extracted:
+                            memory_content += extracted
                         else:
-                            # Fallback if parsing structure isn't exactly as expected
-                            memory_content += raw_text + "\n"
+                            # If recursion found nothing, use raw text but maybe it's just a string list
+                            if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+                                memory_content += "\n".join(parsed) + "\n"
+                            else:
+                                memory_content += raw_text + "\n"
+                                
                     except Exception as e:
                         logger.warning(f"Failed to parse structured memory response: {e}")
-                        # If parsing fails, use the raw text but maybe try to clean it
                         memory_content += raw_text + "\n"
                 else:
                     memory_content += raw_text + "\n"
@@ -237,14 +286,22 @@ def clean_query_text(text: str) -> str:
     to isolate the actual user intent for Cognee search.
     """
     # Pattern for "Here are the first few user messages: ... Based on the conversation"
-    meta_pattern = r"Here are the first few user messages:\s*(.*?)\s*Based on the conversation"
-    match = re.search(meta_pattern, text, re.DOTALL | re.IGNORECASE)
+    # This matches the title generation meta-prompt seen in logs
+    meta_prompt_pattern = r"Here are the first few user messages:\s*(.*?)\s*Based on the conversation"
+    match = re.search(meta_prompt_pattern, text, re.DOTALL | re.IGNORECASE)
+    
     if match:
-        content = match.group(1).strip()
-        logger.info(f"Cleaned query from meta-prompt. Extracted: {content[:100]}...")
-        return content
+        extracted = match.group(1).strip()
+        logger.info(f"Cleaned query from meta-prompt. Extracted: {extracted[:100]}...")
+        # If the extracted part itself has multiple lines or is very long, 
+        # try to get just the last user message part if possible
+        return extracted
 
-    # If no meta-prompt found, just return cleaned text
+    # Pattern for other common meta-instructions like "Please provide a concise description"
+    if "concise description" in text.lower() and "4 words" in text.lower():
+        logger.info("Skipping Cognee search: query appears to be a meta-instruction for title generation")
+        return ""
+
     return text.strip()
 
 @app.post("/v1/chat/completions")
@@ -284,15 +341,19 @@ async def chat_completions(request: Request):
             cleaned_query = clean_query_text(query_text)
             
             # If after cleaning the query is just instructions (like for titles), skip search
-            # We check if it's too short or contains only phrasing from the title prompt
             if not cleaned_query or len(cleaned_query) < 5:
-                logger.info("Skipping Cognee search: cleaned query is empty or too short")
+                logger.info("Skipping Cognee search: cleaned query is empty, too short, or a meta-instruction")
             else:
-                # Use INSIGHTS which returns raw graph triplets (triplets node1 -- rel -- node2)
-                # This avoids LLM 'synthesizing' noise or summaries.
-                logger.info(f"Searching Cognee INSIGHTS for: {cleaned_query}")
-                memories = await search_memories_mcp(cleaned_query)
-                # search_memories_mcp should be updated to use INSIGHTS internally or we pass it
+                # Use CHUNKS which returns raw text segments
+                # We cap the search query length to avoid noise in vector search
+                search_term = cleaned_query
+                if len(search_term) > 300:
+                    # Simple heuristic: for very long messages, Cognee/Vector search 
+                    # can perform better with just the first few hundred characters
+                    search_term = search_term[:300]
+                    
+                logger.info(f"Searching Cognee CHUNKS for: {search_term[:50]}...")
+                memories = await search_memories_mcp(search_term)
         else:
             logger.info("Cognee search skipped due to filter match")
         
@@ -303,7 +364,10 @@ async def chat_completions(request: Request):
         else:
             logger.info("No memories to inject - sending original request")
             
-    # Proxy to LLM provider
+        # Apply rate limiting before proxying
+        await throttler.wait()
+            
+        # Proxy to LLM provider
         # Use configured URL or fallback to OpenRouter
         base_url = get_llm_base_url()
 
